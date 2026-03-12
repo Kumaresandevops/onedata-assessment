@@ -1,0 +1,21 @@
+# ── Customise these before running terraform apply ────────────────────────────
+
+aws_region   = "us-east-1"
+project_name = "ecs-fargate-app"
+
+availability_zones = ["us-east-1a", "us-east-1b"]
+
+# SSM path where you stored the container image URI:
+#   aws ssm put-parameter \
+#     --name "/ecs/container-image-uri" \
+#     --value "123456789.dkr.ecr.us-east-1.amazonaws.com/my-app:latest" \
+#     --type String
+ssm_image_uri_param = "/ecs/container-image-uri"
+
+container_port = 80
+task_cpu       = 256   # 0.25 vCPU
+task_memory    = 512   # 512 MB
+
+# Optional: set to an SNS topic ARN to receive alarm notifications
+# alarm_sns_arn = "arn:aws:sns:us-east-1:123456789012:my-alerts"
+alarm_sns_arn = ""
