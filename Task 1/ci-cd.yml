@@ -1,0 +1,235 @@
+name: CI/CD — Build, Test & Deploy
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+# ─────────────────────────────────────────────
+# Shared env vars available to all jobs
+# ─────────────────────────────────────────────
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+# ╔══════════════════════════════════════════╗
+# ║  JOB 1 — CHECKOUT & LINT                ║
+# ╚══════════════════════════════════════════╝
+  lint:
+    name: 🔍 Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+# ╔══════════════════════════════════════════╗
+# ║  JOB 2 — UNIT TESTS                     ║
+# ╚══════════════════════════════════════════╝
+  unit-test:
+    name: 🧪 Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests with coverage
+        run: npm test -- --ci --forceExit
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+# ╔══════════════════════════════════════════╗
+# ║  JOB 3 — DOCKER BUILD & PUSH            ║
+# ╚══════════════════════════════════════════╝
+  docker-build:
+    name: 🐳 Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: unit-test
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long,prefix=
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.IMAGE_NAME }}:latest
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Output image digest
+        run: echo "Image pushed → ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+
+# ╔══════════════════════════════════════════╗
+# ║  JOB 4 — DEPLOY TO STAGING (with gate)  ║
+# ╚══════════════════════════════════════════╝
+  deploy-staging:
+    name: 🚀 Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: github.ref == 'refs/heads/main'
+
+    # ── Manual approval gate ──────────────────
+    environment:
+      name: staging
+      url: http://localhost:30080
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Set up a local Minikube cluster
+      - name: Start Minikube
+        uses: medyagh/setup-minikube@v0.0.18
+        with:
+          minikube-version: 'latest'
+          kubernetes-version: 'stable'
+          driver: docker
+
+      - name: Verify cluster is ready
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+
+      # Create GHCR pull secret so Minikube can pull the image
+      - name: Create GHCR image pull secret
+        run: |
+          kubectl create secret docker-registry ghcr-secret \
+            --docker-server=ghcr.io \
+            --docker-username=${{ github.actor }} \
+            --docker-password=${{ secrets.GITHUB_TOKEN }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # Substitute env vars into manifests and apply
+      - name: Render and apply Kubernetes manifests
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+        run: |
+          # Substitute placeholders in manifests
+          envsubst < k8s/deployment.yaml | kubectl apply -f -
+          kubectl apply -f k8s/service.yaml
+
+      # Wait for rollout to complete; rollback automatically on failure
+      - name: Wait for rollout & auto-rollback on failure
+        run: |
+          if ! kubectl rollout status deployment/cicd-demo-api --timeout=120s; then
+            echo "❌ Rollout failed — triggering automatic rollback"
+            kubectl rollout undo deployment/cicd-demo-api
+            echo "✅ Rollback complete"
+            exit 1
+          fi
+
+      - name: Show deployment status
+        run: |
+          echo "=== Pods ==="
+          kubectl get pods -l app=cicd-demo-api
+          echo ""
+          echo "=== Services ==="
+          kubectl get svc cicd-demo-api-svc
+
+# ╔══════════════════════════════════════════╗
+# ║  JOB 5 — INTEGRATION TESTS (parallel)   ║
+# ╚══════════════════════════════════════════╝
+  integration-test:
+    name: 🔗 Integration Tests
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Re-spin Minikube to run integration tests against the live service
+      - name: Start Minikube
+        uses: medyagh/setup-minikube@v0.0.18
+        with:
+          minikube-version: 'latest'
+          kubernetes-version: 'stable'
+          driver: docker
+
+      - name: Create GHCR image pull secret
+        run: |
+          kubectl create secret docker-registry ghcr-secret \
+            --docker-server=ghcr.io \
+            --docker-username=${{ github.actor }} \
+            --docker-password=${{ secrets.GITHUB_TOKEN }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Re-apply manifests
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+        run: |
+          envsubst < k8s/deployment.yaml | kubectl apply -f -
+          kubectl apply -f k8s/service.yaml
+          kubectl rollout status deployment/cicd-demo-api --timeout=120s
+
+      - name: Get service URL
+        id: svc-url
+        run: |
+          SVC_URL=$(minikube service cicd-demo-api-svc --url)
+          echo "url=$SVC_URL" >> $GITHUB_OUTPUT
+          echo "Service URL: $SVC_URL"
+
+      - name: Run integration tests
+        run: |
+          chmod +x tests/integration_test.sh
+          tests/integration_test.sh "${{ steps.svc-url.outputs.url }}"
