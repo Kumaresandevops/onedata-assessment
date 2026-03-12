@@ -1,0 +1,270 @@
+# =============================================================================
+#  bitbucket-pipelines.yml
+#  Full-Stack DevOps Automation: Docker Compose + Smoke Tests + Load Test
+# =============================================================================
+
+image: docker:25.0.3
+
+definitions:
+  # ── Shared services (Docker-in-Docker) ───────────────────────────────────
+  services:
+    docker:
+      memory: 3072
+
+  # ── Reusable step caches ──────────────────────────────────────────────────
+  caches:
+    pip: ~/.cache/pip
+
+  # ── Step templates ────────────────────────────────────────────────────────
+  steps:
+    - step: &validate-env
+        name: "🔍 Validate Environment"
+        script:
+          - echo "=== Docker version ==="
+          - docker version
+          - echo "=== Docker Compose version ==="
+          - docker compose version
+          - echo "=== Workspace ==="
+          - ls -la
+
+    - step: &build-and-start
+        name: "🚀 Build & Start Stack"
+        services:
+          - docker
+        script:
+          # ── Create .env from template ───────────────────────────────────
+          - cp .env.template .env
+          - |
+            # Inject pipeline-specific overrides (safe for CI)
+            sed -i "s|GRAFANA_ADMIN_PASSWORD=.*|GRAFANA_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin_ci_pass}|" .env
+            sed -i "s|WEBHOOK_SITE_ID=.*|WEBHOOK_SITE_ID=${WEBHOOK_SITE_ID:-test-webhook-id}|" .env
+          - cat .env
+
+          # ── Build images ────────────────────────────────────────────────
+          - echo "=== Building images ==="
+          - docker compose build --no-cache
+
+          # ── Start services ──────────────────────────────────────────────
+          - echo "=== Starting services ==="
+          - docker compose up -d
+
+          # ── Wait for health checks (max 60s) ────────────────────────────
+          - |
+            echo "=== Waiting for health checks ==="
+            TIMEOUT=60; INTERVAL=5; elapsed=0
+
+            services_and_urls=(
+              "api:http://localhost/health"
+              "nginx:http://localhost/nginx-health"
+              "prometheus:http://localhost:9090/-/healthy"
+              "grafana:http://localhost:3000/api/health"
+              "alertmanager:http://localhost:9093/-/healthy"
+            )
+
+            for entry in "${services_and_urls[@]}"; do
+              svc="${entry%%:*}"
+              url="${entry#*:}"
+              echo -n "  Waiting for $svc..."
+              t=0
+              until docker run --rm --network host curlimages/curl:8.4.0 \
+                    -sf "$url" > /dev/null 2>&1; do
+                if [ $t -ge $TIMEOUT ]; then
+                  echo " TIMEOUT ✗"
+                  echo "Logs for $svc:"
+                  docker compose logs --tail=30 "$svc" || true
+                  exit 1
+                fi
+                printf "."
+                sleep $INTERVAL
+                t=$((t + INTERVAL))
+              done
+              echo " healthy (${t}s) ✓"
+            done
+            echo "=== All services healthy ==="
+
+          # ── Show running containers ─────────────────────────────────────
+          - docker compose ps
+
+    - step: &smoke-tests
+        name: "🧪 Smoke Tests"
+        services:
+          - docker
+        script:
+          - apk add --no-cache bash curl
+          - chmod +x smoke-test.sh
+          - bash smoke-test.sh
+        artifacts:
+          - smoke-test-results.txt
+
+    - step: &load-test
+        name: "📈 Load Test (30s)"
+        services:
+          - docker
+        script:
+          # Install k6
+          - |
+            apk add --no-cache bash curl
+            K6_VERSION="v0.49.0"
+            ARCH="linux_amd64"
+            curl -sL "https://github.com/grafana/k6/releases/download/${K6_VERSION}/k6-${K6_VERSION}-${ARCH}.tar.gz" \
+              -o /tmp/k6.tar.gz
+            tar -xzf /tmp/k6.tar.gz -C /tmp
+            mv "/tmp/k6-${K6_VERSION}-${ARCH}/k6" /usr/local/bin/k6
+            k6 version
+
+          # Run load test
+          - chmod +x load-test.sh
+          - bash load-test.sh 2>&1 | tee load-test-output.txt
+          - |
+            EXIT_CODE=${PIPESTATUS[0]}
+            echo "=== Load test exit code: $EXIT_CODE ==="
+            if [ $EXIT_CODE -ne 0 ]; then
+              echo "FAIL: Load test did not meet thresholds."
+              exit 1
+            fi
+            echo "PASS: Load test passed all thresholds."
+        artifacts:
+          - load-test-output.txt
+
+    - step: &health-check-validation
+        name: "❤️ Health Check Validation (60s deadline)"
+        services:
+          - docker
+        script:
+          - apk add --no-cache bash curl
+          - |
+            echo "=== Verifying Docker health statuses ==="
+            DEADLINE=60; elapsed=0; INTERVAL=5
+            REQUIRED_SERVICES="api redis nginx prometheus grafana alertmanager"
+
+            until [ $elapsed -ge $DEADLINE ]; do
+              ALL_HEALTHY=true
+              for svc in $REQUIRED_SERVICES; do
+                STATUS=$(docker inspect --format='{{.State.Health.Status}}' "$svc" 2>/dev/null || echo "missing")
+                if [ "$STATUS" != "healthy" ]; then
+                  echo "  $svc: $STATUS (not yet healthy)"
+                  ALL_HEALTHY=false
+                fi
+              done
+
+              if $ALL_HEALTHY; then
+                echo "=== All required services are healthy ==="
+                break
+              fi
+
+              sleep $INTERVAL
+              elapsed=$((elapsed + INTERVAL))
+            done
+
+            if ! $ALL_HEALTHY; then
+              echo "FAIL: One or more services unhealthy after ${DEADLINE}s"
+              docker compose ps
+              exit 1
+            fi
+
+    - step: &rate-limit-validation
+        name: "🚦 Rate Limit Validation (Bonus)"
+        services:
+          - docker
+        script:
+          - apk add --no-cache bash curl
+          - |
+            echo "=== Sending burst of 30 requests to /api/visits ==="
+            GOT_429=false
+            for i in $(seq 1 30); do
+              CODE=$(docker run --rm --network host curlimages/curl:8.4.0 \
+                -s -o /dev/null -w "%{http_code}" \
+                http://localhost/api/visits 2>/dev/null || echo "000")
+              echo "  Request $i: HTTP $CODE"
+              if [ "$CODE" = "429" ]; then
+                GOT_429=true
+                echo "  ✓ Rate limit triggered at request $i"
+                break
+              fi
+            done
+
+            if $GOT_429; then
+              echo "PASS: Nginx rate limiting is working correctly."
+            else
+              echo "WARN: No 429 received — rate limit may not be active or burst threshold not hit."
+              # Non-fatal in pipeline (warn only)
+            fi
+
+    - step: &teardown
+        name: "🧹 Teardown"
+        services:
+          - docker
+        script:
+          - docker compose down --volumes --remove-orphans
+          - docker system prune -f
+
+pipelines:
+  # ── Default: runs on every push ──────────────────────────────────────────
+  default:
+    - step:
+        <<: *validate-env
+        name: "🔍 Validate Environment"
+
+    - step:
+        <<: *build-and-start
+        name: "🚀 Build & Start Stack"
+
+    - parallel:
+        - step:
+            <<: *smoke-tests
+        - step:
+            <<: *health-check-validation
+
+    - step:
+        <<: *rate-limit-validation
+
+    - step:
+        <<: *load-test
+
+    - step:
+        <<: *teardown
+        trigger: always    # Always clean up, even on failure
+
+  # ── Pull Requests: lighter check ─────────────────────────────────────────
+  pull-requests:
+    '**':
+      - step:
+          <<: *validate-env
+      - step:
+          <<: *build-and-start
+      - step:
+          <<: *smoke-tests
+      - step:
+          <<: *teardown
+          trigger: always
+
+  # ── Branches: full pipeline for main/develop ──────────────────────────────
+  branches:
+    main:
+      - step:
+          <<: *validate-env
+      - step:
+          <<: *build-and-start
+      - parallel:
+          - step:
+              <<: *smoke-tests
+          - step:
+              <<: *health-check-validation
+      - step:
+          <<: *rate-limit-validation
+      - step:
+          <<: *load-test
+      - step:
+          <<: *teardown
+          trigger: always
+
+    develop:
+      - step:
+          <<: *validate-env
+      - step:
+          <<: *build-and-start
+      - step:
+          <<: *smoke-tests
+      - step:
+          <<: *teardown
+          trigger: always
